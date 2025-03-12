@@ -12,6 +12,7 @@ export class SecretsService {
     maxAttempts: number;
     timeoutMs: number;
     backoffMs: number;
+    concurrentJobs: number;
   }> {
     const command = new GetSecretValueCommand({ SecretId: 'job-config' });
     const response = await this.client.send(command);

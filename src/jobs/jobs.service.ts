@@ -1,6 +1,8 @@
+/* eslint-disable @typescript-eslint/no-unsafe-call */
+/* eslint-disable @typescript-eslint/no-unsafe-argument */
 /* eslint-disable @typescript-eslint/no-unsafe-member-access */
 /* eslint-disable @typescript-eslint/no-unsafe-assignment */
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { SecretsService } from 'src/config/secrets.service';
 import { ApiEvent } from 'src/entities/api-event.entity';
@@ -10,9 +12,12 @@ import { SqsProducerService } from 'src/sqs/sqs-producer.service';
 import { DataSource, Repository } from 'typeorm';
 import axios from 'axios';
 import { plainToInstance } from 'class-transformer';
+import { JobLogger } from 'src/utils/job-logger';
 
 @Injectable()
 export class JobsService {
+  private readonly logger = new Logger(JobsService.name);
+
   constructor(
     private readonly dataSource: DataSource,
     private readonly secretsService: SecretsService,
@@ -31,39 +36,64 @@ export class JobsService {
     await queryRunner.startTransaction();
 
     try {
+      const config = await this.secretsService.getJobConfig();
+      const { concurrentJobs } = config;
+
       const result = await queryRunner.query(`
         SELECT jq.*
         FROM jobs_queue jq
         WHERE jq.status = 'pending'
         FOR UPDATE SKIP LOCKED
-        LIMIT 1
+        LIMIT ${concurrentJobs}
       `);
 
       if (!result || result.length === 0) {
+        this.logger.log('No pending jobs found.');
         await queryRunner.rollbackTransaction();
         return;
       }
 
-      const job: JobsQueue = plainToInstance(JobsQueue, result[0]);
+      const jobs: JobsQueue[] = result.map((row) =>
+        plainToInstance(JobsQueue, row),
+      );
 
-      job.event = await this.eventRepo.findOneByOrFail({ id: job.event.id });
+      this.logger.log(`Found ${jobs.length} job(s) to process.`);
 
-      const config = await this.secretsService.getJobConfig();
-      const { maxAttempts, timeoutMs, backoffMs } = config;
+      await queryRunner.commitTransaction();
+      await queryRunner.release();
 
-      let attempt = 0;
-      let success = false;
-      let response: any;
-      let statusCode = 0;
+      await Promise.allSettled(
+        jobs.map((job) => this.processSingleJob(job, config)),
+      );
+    } catch (e) {
+      await queryRunner.rollbackTransaction();
+      await queryRunner.release();
+      this.logger.error('Error processing jobs batch', e.stack ?? e);
+    }
+  }
 
-      while (attempt < maxAttempts && !success) {
+  private async processSingleJob(job: JobsQueue, config: any): Promise<void> {
+    const logger = new JobLogger(`job-${job.id}`);
+    let attempt = 0;
+    let success = false;
+    let response: any;
+    let statusCode = 0;
+
+    logger.log('Starting Job execution');
+
+    try {
+      const event = await this.eventRepo.findOneByOrFail({ id: job.event.id });
+
+      while (attempt < config.maxAttempts && !success) {
         attempt++;
+        logger.debug('Running attempt', { attempt });
+
         try {
           const res = await axios.request({
-            method: job.event.httpMethod,
-            url: job.event.destinationApiUrl,
-            data: job.event.payload,
-            timeout: timeoutMs,
+            method: event.httpMethod,
+            url: event.destinationApiUrl,
+            data: event.payload,
+            timeout: config.timeoutMs,
           });
 
           statusCode = res.status;
@@ -77,8 +107,10 @@ export class JobsService {
 
           if (statusCode >= 200 && statusCode < 300) {
             success = true;
-            await this.sqsService.sendMessage(job.event.responseQueueUrl, {
-              request_id: job.event.requestId,
+            logger.log('Http Request successfully completed', { statusCode });
+
+            await this.sqsService.sendMessage(event.responseQueueUrl, {
+              request_id: event.requestId,
               statusCode,
               data: response,
               result: 'success',
@@ -86,7 +118,13 @@ export class JobsService {
           }
         } catch (err) {
           statusCode = err.response?.status || 500;
-          response = err.response?.data || { error: 'Request failed' };
+          response = err.response?.data || { error: 'Http Request failed' };
+
+          logger.warn('Http Request Error', {
+            attempt,
+            statusCode,
+            response,
+          });
 
           await this.historyRepo.save({
             job,
@@ -94,13 +132,15 @@ export class JobsService {
             responsePayload: response,
           });
 
-          await new Promise((r) => setTimeout(r, backoffMs));
+          await new Promise((r) => setTimeout(r, config.backoffMs));
         }
       }
 
       if (!success) {
-        await this.sqsService.sendMessage(job.event.responseQueueUrl, {
-          request_id: job.event.requestId,
+        logger.warn('All attempts to run Job failed');
+
+        await this.sqsService.sendMessage(event.responseQueueUrl, {
+          request_id: event.requestId,
           statusCode,
           data: response,
           result: 'failure',
@@ -110,13 +150,9 @@ export class JobsService {
       await this.jobRepo.update(job.id, {
         status: success ? 'completed' : 'failed',
       });
-
-      await queryRunner.commitTransaction();
     } catch (e) {
-      await queryRunner.rollbackTransaction();
-      console.error('Error processing job:', e);
-    } finally {
-      await queryRunner.release();
+      logger.error('Erro during Job execution', e);
+      await this.jobRepo.update(job.id, { status: 'failed' });
     }
   }
 }
